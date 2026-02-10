@@ -12,6 +12,7 @@ from telegram.ext import (
 # IMPORT YOUR EXISTING MODULES
 # Assuming your previous file is named 'TickerGrubProServer.py'
 from TickerGrubProServer import validate_ticker, fetch_market_data, analyze_market_data
+from add_func import get_top_funding_rates, check_extreme_funding  # [NEW]
 
 # 1. SETUP LOGGING (So you can see errors in the console)
 logging.basicConfig(
@@ -28,16 +29,86 @@ REQUEST_COUNT = 0
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends a welcome message when the command /start is issued."""
+    """Sends a welcome message and starts background jobs."""
     await update.message.reply_text(
-        "I am the Volatility Bot. Send me a ticker (e.g., PEPE) to analyze."
+        "I am the Volatility Bot.\n"
+        "Send me a ticker (e.g., PEPE) to analyze.\n"
+        "Use /funding to see top negative funding rates."
     )
+
+    # Start background job immediately
+    chat_id = update.effective_chat.id
+    start_scanning_job(context, chat_id)
+
+
+async def funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends the top 10 negative funding rates."""
+    status_msg = await update.message.reply_text("🔍 Fetching funding rates...")
+
+    # Run in executor to avoid blocking the event loop
+    loop = asyncio.get_event_loop()
+    report = await loop.run_in_executor(None, get_top_funding_rates)
+
+    await status_msg.edit_text(report, parse_mode="Markdown")
+
+
+async def scan_funding_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background task to scan for extreme funding rates."""
+    # Run in executor
+    loop = asyncio.get_event_loop()
+    # Use default threshold from add_func (-0.01) or specify it here if needed.
+    # User wanted -0.01 (1%)
+    report = await loop.run_in_executor(None, check_extreme_funding)
+
+    if report:
+        # Send to the user who started the bot?
+        # Since we don't have a database of users, we can try to send to the chat_id from context.job.chat_id
+        # or broadcast if we had a list.
+        # For this simple bot, we'll assume the job is started with a chat_id.
+        job = context.job
+        if job.chat_id:
+            await context.bot.send_message(
+                job.chat_id, text=report, parse_mode="Markdown"
+            )
+        else:
+            print("[Job] Error: No chat_id in job context.")
+
+
+def start_scanning_job(context, chat_id):
+    """Helper to start the background scanning job if not already running."""
+    try:
+        if context.job_queue:
+            current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+            if not current_jobs:
+                context.job_queue.run_repeating(
+                    scan_funding_job,
+                    interval=1200,  # 20 minutes
+                    first=10,
+                    chat_id=chat_id,
+                    name=str(chat_id),
+                )
+                print(f"[System] Started background funding scan for chat {chat_id}")
+        else:
+            print(
+                "[System] Warning: JobQueue not available. Background scanning disabled."
+            )
+    except Exception as e:
+        print(f"[System] Error initializing background job: {e}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """The Main Event Loop: logic from your old 'main()' goes here."""
     global REQUEST_COUNT
     REQUEST_COUNT += 1
+
+    # Check if we should start the background job for this chat (singleton check logic could be added here)
+    # For simplicity, we just ensure the job is running or start it when user interacts?
+    # Better approach: Start it on /start or just ensure it's added.
+    # But job_queue needs a chat_id to know where to send messages.
+    # Let's add the job if it doesn't exist for this chat.
+    # Check if we should start the background job for this chat
+    chat_id = update.effective_chat.id
+    start_scanning_job(context, chat_id)
 
     # A. Get Input (Replaces 'input()')
     user_text = update.message.text.strip().upper()
@@ -122,7 +193,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 3. THE ENGINE
 if __name__ == "__main__":
     # original prod token
-    #TOKEN = "8567746274:AAGUyI4c5Kt5uETiB9SbwMFbi8sPnOzqr8I"
+    # TOKEN = "8567746274:AAGUyI4c5Kt5uETiB9SbwMFbi8sPnOzqr8I"
 
     # development token for MyStrategyDevBot
     TOKEN = "8407333658:AAFOsgpuO-KhUTL-7VNQfqEQxHGYjRmrN7o"
@@ -131,6 +202,7 @@ if __name__ == "__main__":
 
     # Add handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("funding", funding))  # [NEW]
 
     # This handler listens to ALL text messages that aren't commands
     application.add_handler(
