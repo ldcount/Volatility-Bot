@@ -1,0 +1,31 @@
+[Unit]
+Description=Crypto Volatility Bot Service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ghost
+WorkingDirectory=/home/ghost
+
+# Live logs
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONIOENCODING=UTF-8"
+
+ExecStart=/home/ghost/botenv/bin/python -u /home/ghost/bot.py
+
+Restart=always
+RestartSec=5
+
+# Prevent endless crash-loop hammering
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Give it time to stop gracefully
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
