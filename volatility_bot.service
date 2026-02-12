@@ -5,14 +5,15 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=ghost
-WorkingDirectory=/home/ghost
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/bots/volatility_bot
 
 # Live logs
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONIOENCODING=UTF-8"
 
-ExecStart=/home/ghost/botenv/bin/python -u /home/ghost/bot.py
+ExecStart=/opt/bots/volatility_bot/venv/bin/python /opt/bots/volatility_bot/volatility_bot.py
 
 Restart=always
 RestartSec=5

@@ -110,7 +110,7 @@ def check_extreme_funding(threshold=-0.015):
     # Sort by funding rate for better visibility (lowest (most extreme) first)
     extreme_tickers.sort(key=lambda x: x[1])
 
-    report = "🚨 *EXTREME FUNDING* 🚨\n\n"
+    report = "🚨 *EXTREME FUNDING ALERT* 🚨\n\n"
     for symbol, rate in extreme_tickers:
         report += f"**{symbol}**: {rate*100:.4f}%\n"
 

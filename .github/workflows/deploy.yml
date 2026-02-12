@@ -1,0 +1,35 @@
+name: Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main  # Change to 'master' if that is your primary branch name
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Execute Remote Deployment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # 1. Navigate to the bot directory
+            cd /opt/bots/volatility_bot
+            
+            # 2. Pull the latest code from GitHub
+            git pull origin main
+            
+            # 3. Update dependencies inside the virtual environment
+            ./venv/bin/pip install -r requirements.txt
+            
+            # 4. Restart the service (Sudo works here because of the 'visudo' fix)
+            sudo systemctl restart volatility_bot.service
+            
+            # 5. Check status to ensure it's running
+            systemctl is-active volatility_bot.service
