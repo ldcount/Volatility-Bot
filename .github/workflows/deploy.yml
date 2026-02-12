@@ -3,7 +3,7 @@ name: Continuous Deployment
 on:
   push:
     branches:
-      - master  # Change to 'master' if that is your primary branch name
+      - master
 
 jobs:
   deploy:
@@ -18,18 +18,18 @@ jobs:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 49348 }} # Uses 22 if secret isn't set
           script: |
-            # 1. Navigate to the bot directory
             cd /opt/bots/volatility_bot
             
-            # 2. Pull the latest code from GitHub
+            # 1. Pull the latest code
             git pull origin master
             
-            # 3. Update dependencies inside the virtual environment
+            # 2. Update dependencies
             ./venv/bin/pip install -r requirements.txt
             
-            # 4. Restart the service (Sudo works here because of the 'visudo' fix)
+            # 3. Restart the new service name
             sudo systemctl restart volatility_bot.service
             
-            # 5. Check status to ensure it's running
+            # 4. Verify the bot is active
             systemctl is-active volatility_bot.service

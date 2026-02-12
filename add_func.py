@@ -73,7 +73,7 @@ def get_top_funding_rates(limit=10):
     if not top_tickers:
         return "ℹ️ No coins with negative funding rates found."
 
-    report = "📉 *Most Negative Funding 15*\n\n"
+    report = "📉 *Most Negative Funding YO*\n\n"
     for i, (symbol, rate) in enumerate(top_tickers, 1):
         # Rate is usually 8-hour rate. User wants %.
         # e.g. -0.005 is -0.5%
