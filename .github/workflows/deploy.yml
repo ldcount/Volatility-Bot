@@ -3,7 +3,7 @@ name: Continuous Deployment
 on:
   push:
     branches:
-      - main  # Change to 'master' if that is your primary branch name
+      - master  # Change to 'master' if that is your primary branch name
 
 jobs:
   deploy:
@@ -23,7 +23,7 @@ jobs:
             cd /opt/bots/volatility_bot
             
             # 2. Pull the latest code from GitHub
-            git pull origin main
+            git pull origin master
             
             # 3. Update dependencies inside the virtual environment
             ./venv/bin/pip install -r requirements.txt
