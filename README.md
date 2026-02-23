@@ -14,12 +14,22 @@ A Telegram bot that analyzes crypto market volatility using Bybit market data.
   - Pump percentiles (75/80/85/90/95/99)
 - Supports funding-rate features:
   - `/funding` command for most negative funding rates
-  - Background scan for extreme negative funding rates
+  - Background scan for extreme negative funding rates with configurable frequency
+
+## Bot commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Initialize the bot and begin the background funding scan for your chat. |
+| `/funding` | Fetch the top 10 most negative funding rates on Bybit right now. |
+| `/frequency <minutes>` | Set how often the background scan runs. E.g. `/frequency 30` = every 30 min, `/frequency 1` = every minute. |
+| `/help` | Show the full list of commands with explanations. |
+| `<TICKER>` | Send any coin name (e.g. `BTC`, `PEPE`) for a full volatility report. |
 
 ## Repository structure
 
-- `bot.py` — Telegram bot entrypoint and command/message handlers.
-- `TickerGrubProServer.py` — Core market validation, data fetching, and analysis logic.
+- `volatility_bot.py` — Telegram bot entrypoint and command/message handlers.
+- `data_processing.py` — Core market validation, data fetching, and analysis logic.
 - `add_func.py` — Funding-rate data collection and alert helpers.
 - `requirements.txt` — Python dependencies.
 - `TickerGrubProServer.service` — Example systemd unit file.
@@ -45,33 +55,36 @@ pip install -r requirements.txt
 
 ## Configuration
 
-`bot.py` currently contains a hardcoded token. For safer operation, prefer using an environment variable.
+Create a `.env` file in the project root (see `.env.example` if present) with the following keys:
 
-Example shell setup:
-
-```bash
-export TELEGRAM_BOT_TOKEN="<your-telegram-bot-token>"
+```env
+TELEGRAM_TOKEN_PROD=<your-telegram-bot-token>
+FUNDING_THRESHOLD=-0.015     # Alert when funding rate is at or below this value
+SCAN_INTERVAL=1200           # Default background scan interval in seconds (20 min)
 ```
 
-Then update `bot.py` to read from `os.getenv("TELEGRAM_BOT_TOKEN")` before launching the bot.
+The scan interval can also be changed at runtime via the `/frequency` command without restarting the bot.
 
 ## Run locally
 
 ```bash
-python bot.py
+python volatility_bot.py
 ```
 
 Once running, in Telegram:
 
-- `/start` to initialize the bot and begin background funding scan for your chat.
-- Send a ticker like `BTC` or `PEPE` to get volatility analysis.
-- `/funding` to view the top negative funding rates.
+- `/start` — initialize the bot and begin background funding scan.
+- `/funding` — view the top negative funding rates on demand.
+- `/frequency 30` — change the background scan to run every 30 minutes.
+- `/help` — view all available commands.
+- Send a ticker like `BTC` or `PEPE` to get a volatility analysis report.
 
 ## Background funding scan behavior
 
-- A repeating job is created per chat after `/start` (or interaction).
-- Interval is 20 minutes.
-- The job sends alerts when funding rates are at or below the configured threshold in `add_func.py`.
+- A repeating job is created per chat after `/start` (or on first interaction).
+- Default interval is controlled by `SCAN_INTERVAL` in `.env` (default: 1200 s / 20 min).
+- The interval can be changed live at any time with `/frequency <minutes>`.
+- The job sends alerts when funding rates are at or below the configured threshold.
 
 ## Deployment (systemd)
 
@@ -92,4 +105,4 @@ sudo systemctl status TickerGrubProServer.service
 ## Notes
 
 - The bot depends on live external APIs; failures can occur due to network issues or API limits.
-- If Bybit changes response shapes, helper logic in `TickerGrubProServer.py` and `add_func.py` may need updates.
+- If Bybit changes response shapes, helper logic in `data_processing.py` and `add_func.py` may need updates.

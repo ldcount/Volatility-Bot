@@ -35,9 +35,12 @@ REQUEST_COUNT = 0
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends a welcome message and starts background jobs."""
     await update.message.reply_text(
-        "I am the Volatility Bot.\n"
-        "Send me a ticker (e.g., PEPE) to analyze.\n"
-        "Use /funding to see top negative funding rates."
+        "👋 I am the Volatility Bot.\n"
+        "Send me a ticker (e.g., PEPE) to analyze.\n\n"
+        "Commands:\n"
+        "/funding — top negative funding rates\n"
+        "/frequency <min> — set background scan interval\n"
+        "/help — list all commands"
     )
 
     # Start background job immediately
@@ -87,26 +90,89 @@ async def scan_funding_job(context: ContextTypes.DEFAULT_TYPE):
             print("[Job] Error: No chat_id in job context.")
 
 
-def start_scanning_job(context, chat_id):
-    """Helper to start the background scanning job if not already running."""
+def start_scanning_job(context, chat_id, interval_seconds: int | None = None):
+    """Helper to start (or restart) the background scanning job.
+
+    If *interval_seconds* is provided the existing job is cancelled and a new
+    one is created with the new interval.  Otherwise the job is only started
+    when it is not already running.
+    """
+    if interval_seconds is None:
+        # Use a previously saved interval, or fall back to the .env default.
+        interval_seconds = context.bot_data.get(
+            f"scan_interval_{chat_id}",
+            int(os.getenv("SCAN_INTERVAL", 1200)),
+        )
+
     try:
         if context.job_queue:
             current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-            if not current_jobs:
-                context.job_queue.run_repeating(
-                    scan_funding_job,
-                    interval=int(os.getenv("SCAN_INTERVAL", 1200)),
-                    first=10,
-                    chat_id=chat_id,
-                    name=str(chat_id),
-                )
-                print(f"[System] Started background funding scan for chat {chat_id}")
+            if current_jobs:
+                if interval_seconds is None:
+                    # Already running, nothing to do.
+                    return
+                # Cancel existing jobs before re-scheduling.
+                for job in current_jobs:
+                    job.schedule_removal()
+
+            context.job_queue.run_repeating(
+                scan_funding_job,
+                interval=interval_seconds,
+                first=10,
+                chat_id=chat_id,
+                name=str(chat_id),
+            )
+            # Persist so future restarts/reschedules remember the value.
+            context.bot_data[f"scan_interval_{chat_id}"] = interval_seconds
+            print(
+                f"[System] Background funding scan for chat {chat_id} "
+                f"set to every {interval_seconds}s."
+            )
         else:
             print(
                 "[System] Warning: JobQueue not available. Background scanning disabled."
             )
     except Exception as e:
         print(f"[System] Error initializing background job: {e}")
+
+
+async def frequency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the background scan interval. Usage: /frequency <minutes>"""
+    chat_id = update.effective_chat.id
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "⚠️ Usage: /frequency <minutes>\n"
+            "Example: /frequency 30  →  scan every 30 minutes"
+        )
+        return
+
+    minutes = int(context.args[0])
+    if minutes < 1:
+        await update.message.reply_text("⚠️ Interval must be at least 1 minute.")
+        return
+
+    interval_seconds = minutes * 60
+    start_scanning_job(context, chat_id, interval_seconds=interval_seconds)
+    await update.message.reply_text(
+        f"✅ Background scan interval updated to every {minutes} minute(s)."
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a concise list of all available bot commands."""
+    help_text = (
+        "🤖 *Volatility Bot — Available Commands*\n\n"
+        "/start — Initialize the bot and start background funding scan\n"
+        "/funding — Fetch the top 10 most negative funding rates right now\n"
+        "/frequency <min> — Change how often the background scan runs "
+        "(e.g. `/frequency 30` = every 30 min)\n"
+        "/help — Show this help message\n\n"
+        "💬 *Ticker analysis*\n"
+        "Send any coin name (e.g. `BTC`, `PEPE`) to receive a full "
+        "volatility report with ATR, pump/dump extremes, and DCA levels."
+    )
+    await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,7 +275,7 @@ if __name__ == "__main__":
     TOKEN = os.getenv("TELEGRAM_TOKEN_PROD")
 
     # development token for DevelopmentDloBot
-    #TOKEN = os.getenv("TELEGRAM_TOKEN_DEV")
+    # TOKEN = os.getenv("TELEGRAM_TOKEN_DEV")
 
     if not TOKEN:
         print("Error: TELEGRAM_TOKEN_PROD not found in .env file.")
@@ -219,7 +285,9 @@ if __name__ == "__main__":
 
     # Add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("funding", funding))  # [NEW]
+    application.add_handler(CommandHandler("funding", funding))
+    application.add_handler(CommandHandler("frequency", frequency))
+    application.add_handler(CommandHandler("help", help_command))
 
     # This handler listens to ALL text messages that aren't commands
     application.add_handler(
