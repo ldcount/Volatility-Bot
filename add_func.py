@@ -99,7 +99,7 @@ def get_top_funding_rates(limit=10):
     if not top_tickers:
         return "ℹ️ No coins with negative funding rates found."
 
-    report = "📉 *Top 10 negative funding*\n\n"
+    report = "🚩 *Top 10 negative funding*\n\n"
     for i, (symbol, rate) in enumerate(top_tickers, 1):
         okx_rate = get_okx_funding_rate(symbol)
         okx_part = _format_okx_bracket(okx_rate)
