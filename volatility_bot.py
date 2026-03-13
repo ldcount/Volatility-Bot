@@ -1,442 +1,153 @@
-import asyncio
 import logging
+import asyncio
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 from dotenv import load_dotenv
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LinkPreviewOptions,
-    Update,
-)
+
+# Load environment variables
+load_dotenv()
+from telegram import Update, LinkPreviewOptions
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
-    CommandHandler,
     ContextTypes,
+    CommandHandler,
     MessageHandler,
     filters,
 )
 
-from add_func import check_extreme_funding, get_top_funding_rates
-from data_processing import (
-    analyze_symbol,
-    get_top_liquid_symbols,
-    normalize_symbol,
-)
+# IMPORT YOUR EXISTING MODULES
+from data_processing import validate_ticker, fetch_market_data, analyze_market_data
+from add_func import get_top_funding_rates, check_extreme_funding  # [NEW]
 
-load_dotenv()
-
+# 1. SETUP LOGGING (So you can see errors in the console)
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+
+# 2. ADD THIS LINE to silence the repetitive network logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+# Global Request Counter
 REQUEST_COUNT = 0
-DEFAULT_SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 1200))
-DEFAULT_FUNDING_THRESHOLD = float(os.getenv("FUNDING_THRESHOLD", -0.015))
-TOPVOL_UNIVERSE_SIZE = 25
-TOPVOL_MAX_WORKERS = 6
 
-
-def _scan_interval_key(chat_id: int) -> str:
-    return f"scan_interval_{chat_id}"
-
-
-def _threshold_key(chat_id: int) -> str:
-    return f"funding_threshold_{chat_id}"
-
-
-def get_chat_threshold(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> float:
-    return context.bot_data.get(_threshold_key(chat_id), DEFAULT_FUNDING_THRESHOLD)
-
-
-def get_chat_interval(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> int:
-    return context.bot_data.get(_scan_interval_key(chat_id), DEFAULT_SCAN_INTERVAL)
-
-
-def format_percent(value: float, digits: int = 2) -> str:
-    return f"{value * 100:.{digits}f}%"
-
-
-def format_threshold(value: float) -> str:
-    return f"{value * 100:.2f}%"
-
-
-def classify_regime(stats: dict) -> str:
-    atr_rel = stats.get("atr_relative", 0)
-    vol_day = stats.get("vol_day", 0)
-    score = max(atr_rel, vol_day)
-    if score >= 0.12:
-        return "extreme"
-    if score >= 0.08:
-        return "elevated"
-    if score >= 0.04:
-        return "normal"
-    return "calm"
-
-
-def analysis_error_message(symbol: str, error_code: str | None) -> str:
-    if error_code == "not_found":
-        return f"❌ `{symbol}` was not found on Bybit."
-    if error_code == "timeout":
-        return (
-            f"⚠️ Bybit timed out while processing `{symbol}`. "
-            "Try again in a moment."
-        )
-    if error_code == "network":
-        return (
-            f"⚠️ Network error while contacting Bybit for `{symbol}`. "
-            "Try again in a moment."
-        )
-    if error_code == "empty_data":
-        return f"⚠️ Bybit returned no candle data for `{symbol}`."
-    if error_code == "insufficient_data":
-        return f"⚠️ Not enough historical data to analyze `{symbol}`."
-    return f"⚠️ Could not analyze `{symbol}` because the exchange API returned an unexpected error."
-
-
-def parse_threshold_input(raw_value: str) -> float:
-    value = raw_value.strip().replace("%", "").replace(",", ".")
-    threshold = float(value)
-    if threshold > 0:
-        threshold = -threshold
-    if abs(threshold) >= 1:
-        threshold /= 100
-    if threshold >= 0 or threshold <= -1:
-        raise ValueError("Threshold must be a negative percentage.")
-    return threshold
-
-
-def build_general_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Funding", callback_data="funding"),
-                InlineKeyboardButton("Top Vol", callback_data="topvol:daily"),
-            ],
-            [
-                InlineKeyboardButton("Set Rate", callback_data="setrate"),
-                InlineKeyboardButton("Frequency", callback_data="frequency"),
-            ],
-        ]
-    )
-
-
-def build_symbol_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Refresh", callback_data=f"ticker:{symbol}"),
-                InlineKeyboardButton("Risk", callback_data=f"risk:{symbol}"),
-            ],
-            [
-                InlineKeyboardButton("Funding", callback_data="funding"),
-                InlineKeyboardButton("Top Vol", callback_data="topvol:daily"),
-            ],
-            [
-                InlineKeyboardButton("Set Rate", callback_data="setrate"),
-                InlineKeyboardButton("Frequency", callback_data="frequency"),
-            ],
-        ]
-    )
-
-
-def build_analysis_report(payload: dict) -> str:
-    stats = payload["stats"]
-    symbol = payload["symbol"]
-    category = payload["category"]
-    candles = payload["candles"]
-    regime = classify_regime(stats)
-
-    return (
-        f"📊 *{symbol}*  `{category}`\n"
-        f"Regime: *{regime}*\n"
-        f"History: {len(candles)} daily candles\n\n"
-        f"*Volatility*\n"
-        f"Day: {format_percent(stats['vol_day'])}\n"
-        f"Week: {format_percent(stats['vol_week'])}\n"
-        f"Max surge: {format_percent(stats['max_daily_surge'])}\n"
-        f"Max crash: {format_percent(stats['max_daily_crash'])}\n\n"
-        f"*Intraday extremes*\n"
-        f"Biggest pump: {format_percent(stats['max_pump_val'])} on {stats['max_pump_date']}\n"
-        f"Worst dump: {format_percent(stats['max_dump_val'])} on {stats['max_dump_date']}\n"
-        f"Avg pump: {format_percent(stats['avg_pump'])}\n"
-        f"Avg dump: {format_percent(stats['avg_dump'])}\n\n"
-        f"*Risk frame*\n"
-        f"ATR 14: `{stats['atr_14']:.6f}`\n"
-        f"ATR 28: `{stats['atr_28']:.6f}`\n"
-        f"ATR / close: {format_percent(stats['atr_relative'])}\n\n"
-        f"*DCA ladder ideas*\n"
-        f"75%: {format_percent(stats['p75_pump'])}\n"
-        f"80%: {format_percent(stats['p80_pump'])}\n"
-        f"85%: {format_percent(stats['p85_pump'])}\n"
-        f"90%: {format_percent(stats['p90_pump'])}\n"
-        f"95%: {format_percent(stats['p95_pump'])}\n"
-        f"99%: {format_percent(stats['p99_pump'])}"
-    )
-
-
-def build_risk_report(payload: dict) -> str:
-    stats = payload["stats"]
-    symbol = payload["symbol"]
-    last_close = stats["close"]
-    atr_pct = stats["atr_relative"]
-
-    stop_pct = max(abs(stats["max_dump_val"]) * 0.6, atr_pct * 1.5)
-    stop_price = last_close * (1 - stop_pct)
-
-    ladder_1 = stats["p75_pump"]
-    ladder_2 = stats["p85_pump"]
-    ladder_3 = stats["p95_pump"]
-
-    return (
-        f"🛡️ *Risk frame for {symbol}*\n\n"
-        f"Last close: `{last_close:.6f}`\n"
-        f"ATR / close: {format_percent(atr_pct)}\n"
-        f"Worst historical dump: {format_percent(stats['max_dump_val'])}\n\n"
-        f"*Short-side ladder heuristic*\n"
-        f"Starter spacing: {format_percent(ladder_1)}\n"
-        f"Add 2 spacing: {format_percent(ladder_2)}\n"
-        f"Stress spacing: {format_percent(ladder_3)}\n\n"
-        f"*Risk control heuristic*\n"
-        f"Suggested emergency distance: {format_percent(stop_pct)}\n"
-        f"Approx stop price from last close: `{stop_price:.6f}`\n\n"
-        "These are statistical heuristics from historical candles, not trading advice."
-    )
-
-
-def build_compare_report(symbols: list[str]) -> str:
-    results = []
-    with ThreadPoolExecutor(max_workers=min(len(symbols), 4)) as executor:
-        future_map = {executor.submit(analyze_symbol, symbol): symbol for symbol in symbols}
-        for future in as_completed(future_map):
-            results.append(future.result())
-
-    result_map = {item["symbol"]: item for item in results}
-    ordered = [result_map[normalize_symbol(symbol)] for symbol in symbols]
-
-    lines = ["📚 *Symbol comparison*\n"]
-    for item in ordered:
-        if not item["ok"]:
-            lines.append(f"- `{item['symbol']}`: {analysis_error_message(item['symbol'], item['error'])}")
-            continue
-
-        stats = item["stats"]
-        lines.append(
-            f"*{item['symbol']}* `{item['category']}` | "
-            f"day vol {format_percent(stats['vol_day'])} | "
-            f"week vol {format_percent(stats['vol_week'])} | "
-            f"ATR {format_percent(stats['atr_relative'])} | "
-            f"worst dump {format_percent(stats['max_dump_val'])}"
-        )
-
-    return "\n".join(lines)
-
-
-def build_topvol_report(metric: str = "daily", limit: int = 10) -> str:
-    symbols = get_top_liquid_symbols(limit=max(TOPVOL_UNIVERSE_SIZE, limit * 2))
-    if not symbols:
-        return "⚠️ Could not fetch liquid Bybit symbols for volatility ranking."
-
-    analyzed = []
-    with ThreadPoolExecutor(max_workers=min(TOPVOL_MAX_WORKERS, len(symbols))) as executor:
-        future_map = {
-            executor.submit(analyze_symbol, symbol, "linear"): symbol for symbol in symbols
-        }
-        for future in as_completed(future_map):
-            result = future.result()
-            if result["ok"]:
-                analyzed.append(result)
-
-    if not analyzed:
-        return "⚠️ Unable to build the volatility ranking because market data requests failed."
-
-    metric_key = "vol_week" if metric == "weekly" else "vol_day"
-    metric_label = "weekly" if metric == "weekly" else "daily"
-    ranked = sorted(
-        analyzed,
-        key=lambda item: item["stats"][metric_key],
-        reverse=True,
-    )[:limit]
-
-    lines = [f"🔥 *Top {len(ranked)} {metric_label} volatility names*\n"]
-    for index, item in enumerate(ranked, 1):
-        stats = item["stats"]
-        lines.append(
-            f"{index}. `{item['symbol']}` "
-            f"| {metric_label} vol {format_percent(stats[metric_key])} "
-            f"| ATR {format_percent(stats['atr_relative'])} "
-            f"| regime {classify_regime(stats)}"
-        )
-
-    lines.append(
-        "\nUniverse: most liquid Bybit linear symbols by 24h turnover."
-    )
-    return "\n".join(lines)
-
-
-async def run_blocking(func, *args):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, func, *args)
-
-
-async def send_analysis_message(
-    message_target,
-    symbol: str,
-    status_prefix: str = "🔍 Checking",
-):
-    global REQUEST_COUNT
-    REQUEST_COUNT += 1
-
-    normalized = normalize_symbol(symbol)
-    status_msg = await message_target.reply_text(f"{status_prefix} `{normalized}`...", parse_mode="Markdown")
-    payload = await run_blocking(analyze_symbol, normalized)
-
-    if not payload["ok"]:
-        await status_msg.edit_text(
-            analysis_error_message(normalized, payload["error"]),
-            parse_mode="Markdown",
-        )
-        return
-
-    report = build_analysis_report(payload)
-    await status_msg.edit_text(
-        report,
-        parse_mode="Markdown",
-        reply_markup=build_symbol_keyboard(payload["symbol"]),
-    )
-
-    print(f"[Result] Request #{REQUEST_COUNT}: Sent report for {payload['symbol']}.")
-
-
-async def send_risk_message(message_target, symbol: str):
-    normalized = normalize_symbol(symbol)
-    status_msg = await message_target.reply_text(f"🛡️ Building risk frame for `{normalized}`...", parse_mode="Markdown")
-    payload = await run_blocking(analyze_symbol, normalized)
-
-    if not payload["ok"]:
-        await status_msg.edit_text(
-            analysis_error_message(normalized, payload["error"]),
-            parse_mode="Markdown",
-        )
-        return
-
-    await status_msg.edit_text(
-        build_risk_report(payload),
-        parse_mode="Markdown",
-        reply_markup=build_symbol_keyboard(payload["symbol"]),
-    )
-
-
-async def send_funding_message(message_target, limit: int = 10):
-    status_msg = await message_target.reply_text("🔍 Fetching funding rates...")
-    report = await run_blocking(get_top_funding_rates, limit)
-    await status_msg.edit_text(
-        report,
-        parse_mode="Markdown",
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=build_general_keyboard(),
-    )
-
-
-def start_scanning_job(context, chat_id, interval_seconds: int | None = None):
-    if interval_seconds is None:
-        interval_seconds = get_chat_interval(context, chat_id)
-
-    if not context.job_queue:
-        print("[System] Warning: JobQueue not available. Background scanning disabled.")
-        return
-
-    current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-    if current_jobs and interval_seconds == get_chat_interval(context, chat_id):
-        return
-
-    for job in current_jobs:
-        job.schedule_removal()
-
-    context.job_queue.run_repeating(
-        scan_funding_job,
-        interval=interval_seconds,
-        first=10,
-        chat_id=chat_id,
-        name=str(chat_id),
-    )
-    context.bot_data[_scan_interval_key(chat_id)] = interval_seconds
-    print(f"[System] Background funding scan for chat {chat_id} set to every {interval_seconds}s.")
-
-
-async def scan_funding_job(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    if not job or not job.chat_id:
-        return
-
-    threshold = get_chat_threshold(context, job.chat_id)
-    report = await run_blocking(check_extreme_funding, threshold)
-    if not report:
-        return
-
-    await context.bot.send_message(
-        job.chat_id,
-        text=report,
-        parse_mode="Markdown",
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=build_general_keyboard(),
-    )
+# 2. THE HANDLERS (The new "Input/Output" layer)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends a welcome message and starts background jobs."""
+    await update.message.reply_text(
+        "👋 I am the Volatility Bot.\n"
+        "Send me a ticker (e.g., PEPE) to analyze.\n\n"
+        "Commands:\n"
+        "/funding — top negative funding rates\n"
+        "/frequency <min> — set background scan interval\n"
+        "/help — list all commands"
+    )
+
+    # Start background job immediately
     chat_id = update.effective_chat.id
     start_scanning_job(context, chat_id)
-    threshold = get_chat_threshold(context, chat_id)
-    interval_minutes = get_chat_interval(context, chat_id) // 60
-
-    await update.message.reply_text(
-        "👋 *Volatility Bot is ready*\n\n"
-        "Use `/ticker BTC` for analysis.\n"
-        "Use `/compare BTC ETH SOL` to compare names.\n"
-        "Use `/funding` for negative funding, `/topvol` for rankers, and `/risk BTC` for ladder heuristics.\n\n"
-        f"Current funding alert threshold: `{format_threshold(threshold)}`\n"
-        f"Current scan frequency: `{interval_minutes}` minute(s)",
-        parse_mode="Markdown",
-        reply_markup=build_general_keyboard(),
-    )
 
 
 async def funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    limit = 10
-    if context.args:
-        try:
-            limit = max(1, min(20, int(context.args[0])))
-        except ValueError:
-            await update.message.reply_text("⚠️ Usage: `/funding` or `/funding 15`", parse_mode="Markdown")
-            return
+    """Sends the top 10 negative funding rates."""
+    status_msg = await update.message.reply_text("🔍 Fetching funding rates...")
 
-    await send_funding_message(update.message, limit)
+    # Run in executor to avoid blocking the event loop
+    loop = asyncio.get_event_loop()
+    report = await loop.run_in_executor(None, get_top_funding_rates)
+
+    await status_msg.edit_text(
+        report,
+        parse_mode="Markdown",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def scan_funding_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background task to scan for extreme funding rates."""
+    # Run in executor
+    loop = asyncio.get_event_loop()
+    # Use default threshold from add_func (-0.01) or specify it here if needed.
+    # User wanted -0.01 (1%)
+    # Get threshold from env, default to -0.015 if not set
+    threshold = float(os.getenv("FUNDING_THRESHOLD", -0.015))
+    report = await loop.run_in_executor(None, check_extreme_funding, threshold)
+
+    if report:
+        # Send to the user who started the bot?
+        # Since we don't have a database of users, we can try to send to the chat_id from context.job.chat_id
+        # or broadcast if we had a list.
+        # For this simple bot, we'll assume the job is started with a chat_id.
+        job = context.job
+        if job.chat_id:
+            await context.bot.send_message(
+                job.chat_id,
+                text=report,
+                parse_mode="Markdown",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        else:
+            print("[Job] Error: No chat_id in job context.")
+
+
+def start_scanning_job(context, chat_id, interval_seconds: int | None = None):
+    """Helper to start (or restart) the background scanning job.
+
+    If *interval_seconds* is provided the existing job is cancelled and a new
+    one is created with the new interval.  Otherwise the job is only started
+    when it is not already running.
+    """
+    if interval_seconds is None:
+        # Use a previously saved interval, or fall back to the .env default.
+        interval_seconds = context.bot_data.get(
+            f"scan_interval_{chat_id}",
+            int(os.getenv("SCAN_INTERVAL", 1200)),
+        )
+
+    try:
+        if context.job_queue:
+            current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+            if current_jobs:
+                if interval_seconds is None:
+                    # Already running, nothing to do.
+                    return
+                # Cancel existing jobs before re-scheduling.
+                for job in current_jobs:
+                    job.schedule_removal()
+
+            context.job_queue.run_repeating(
+                scan_funding_job,
+                interval=interval_seconds,
+                first=10,
+                chat_id=chat_id,
+                name=str(chat_id),
+            )
+            # Persist so future restarts/reschedules remember the value.
+            context.bot_data[f"scan_interval_{chat_id}"] = interval_seconds
+            print(
+                f"[System] Background funding scan for chat {chat_id} "
+                f"set to every {interval_seconds}s."
+            )
+        else:
+            print(
+                "[System] Warning: JobQueue not available. Background scanning disabled."
+            )
+    except Exception as e:
+        print(f"[System] Error initializing background job: {e}")
 
 
 async def frequency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the background scan interval. Usage: /frequency <minutes>"""
     chat_id = update.effective_chat.id
 
-    if not context.args:
-        minutes = get_chat_interval(context, chat_id) // 60
+    if not context.args or not context.args[0].isdigit():
         await update.message.reply_text(
-            f"Current scan frequency: `{minutes}` minute(s)\nUse `/frequency 30` to change it.",
-            parse_mode="Markdown",
+            "⚠️ Usage: /frequency <minutes>\n"
+            "Example: /frequency 30  →  scan every 30 minutes"
         )
         return
 
-    try:
-        minutes = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text(
-            "⚠️ Usage: `/frequency <minutes>`\nExample: `/frequency 30`",
-            parse_mode="Markdown",
-        )
-        return
-
+    minutes = int(context.args[0])
     if minutes < 1:
         await update.message.reply_text("⚠️ Interval must be at least 1 minute.")
         return
@@ -444,206 +155,144 @@ async def frequency(update: Update, context: ContextTypes.DEFAULT_TYPE):
     interval_seconds = minutes * 60
     start_scanning_job(context, chat_id, interval_seconds=interval_seconds)
     await update.message.reply_text(
-        f"✅ Background scan interval updated to every `{minutes}` minute(s).",
-        parse_mode="Markdown",
+        f"✅ Background scan interval updated to every {minutes} minute(s)."
     )
-
-
-async def rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args:
-        threshold = get_chat_threshold(context, chat_id)
-        await update.message.reply_text(
-            f"Current funding alert threshold: `{format_threshold(threshold)}`\n"
-            "Use `/rate -1.8` to alert at or below -1.80% funding.",
-            parse_mode="Markdown",
-        )
-        return
-
-    try:
-        threshold = parse_threshold_input(context.args[0])
-    except ValueError:
-        await update.message.reply_text(
-            "⚠️ Usage: `/rate -1.8` or `/rate -0.018`\n"
-            "Value must be negative and represent a percent threshold.",
-            parse_mode="Markdown",
-        )
-        return
-
-    context.bot_data[_threshold_key(chat_id)] = threshold
-    await update.message.reply_text(
-        f"✅ Funding alert threshold updated to `{format_threshold(threshold)}`.",
-        parse_mode="Markdown",
-    )
-
-
-async def ticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "⚠️ Usage: `/ticker BTC` or `/ticker BTCUSDT`",
-            parse_mode="Markdown",
-        )
-        return
-
-    chat_id = update.effective_chat.id
-    start_scanning_job(context, chat_id)
-    await send_analysis_message(update.message, context.args[0])
-
-
-async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "⚠️ Usage: `/compare BTC ETH SOL`\nCompare at least two symbols.",
-            parse_mode="Markdown",
-        )
-        return
-
-    symbols = [normalize_symbol(arg) for arg in context.args[:5]]
-    status_msg = await update.message.reply_text("📚 Building comparison...")
-    report = await run_blocking(build_compare_report, symbols)
-    await status_msg.edit_text(
-        report,
-        parse_mode="Markdown",
-        reply_markup=build_general_keyboard(),
-    )
-
-
-async def topvol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    metric = "daily"
-    limit = 10
-
-    if context.args:
-        first = context.args[0].lower()
-        if first in {"daily", "weekly"}:
-            metric = first
-            if len(context.args) > 1:
-                try:
-                    limit = max(3, min(15, int(context.args[1])))
-                except ValueError:
-                    await update.message.reply_text(
-                        "⚠️ Usage: `/topvol`, `/topvol weekly`, or `/topvol weekly 8`",
-                        parse_mode="Markdown",
-                    )
-                    return
-        else:
-            try:
-                limit = max(3, min(15, int(context.args[0])))
-            except ValueError:
-                await update.message.reply_text(
-                    "⚠️ Usage: `/topvol`, `/topvol weekly`, or `/topvol weekly 8`",
-                    parse_mode="Markdown",
-                )
-                return
-
-    status_msg = await update.message.reply_text("🔥 Ranking volatility leaders...")
-    report = await run_blocking(build_topvol_report, metric, limit)
-    await status_msg.edit_text(
-        report,
-        parse_mode="Markdown",
-        reply_markup=build_general_keyboard(),
-    )
-
-
-async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "⚠️ Usage: `/risk BTC` or `/risk BTCUSDT`",
-            parse_mode="Markdown",
-        )
-        return
-
-    await send_risk_message(update.message, context.args[0])
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *Volatility Bot commands*\n\n"
-        "/start - start the bot for this chat and enable background funding scans\n"
-        "/ticker <symbol> - full volatility report for one symbol\n"
-        "/compare <symbol1> <symbol2> ... - compare up to 5 symbols\n"
-        "/funding [limit] - most negative funding rates right now\n"
-        "/rate <negative percent> - set alert threshold, example `/rate -1.8`\n"
-        "/frequency <minutes> - set background scan interval\n"
-        "/topvol [daily|weekly] [limit] - rank the most volatile liquid linear names\n"
-        "/risk <symbol> - ATR and ladder-based risk frame\n"
-        "/help - show this help message\n\n"
-        "Plain text messages no longer trigger analysis. Use `/ticker BTC` instead.",
-        parse_mode="Markdown",
+    """Send a concise list of all available bot commands."""
+    help_text = (
+        "🤖 *Volatility Bot — Available Commands*\n\n"
+        "/start — Initialize the bot and start background funding scan\n"
+        "/funding — Fetch the top 10 most negative funding rates right now\n"
+        "/frequency <min> — Change how often the background scan runs "
+        "(e.g. `/frequency 30` = every 30 min)\n"
+        "/help — Show this help message\n\n"
+        "💬 *Ticker analysis*\n"
+        "Send any coin name (e.g. `BTC`, `PEPE`) to receive a full "
+        "volatility report with ATR, pump/dump extremes, and DCA levels."
     )
+    await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The Main Event Loop: logic from your old 'main()' goes here."""
+    global REQUEST_COUNT
+    REQUEST_COUNT += 1
 
-    if data == "funding":
-        await send_funding_message(query.message)
+    # Check if we should start the background job for this chat (singleton check logic could be added here)
+    # For simplicity, we just ensure the job is running or start it when user interacts?
+    # Better approach: Start it on /start or just ensure it's added.
+    # But job_queue needs a chat_id to know where to send messages.
+    # Let's add the job if it doesn't exist for this chat.
+    # Check if we should start the background job for this chat
+    chat_id = update.effective_chat.id
+    start_scanning_job(context, chat_id)
+
+    # A. Get Input (Replaces 'input()')
+    user_text = update.message.text.strip().upper()
+
+    # Notify user we are working (Logic takes time)
+    status_msg = await update.message.reply_text(f"🔍 Checking {user_text}...")
+
+    # B. Gatekeeper Logic
+    # Fix Ticker
+    if not user_text.endswith("USDT"):
+        target_symbol = user_text + "USDT"
+    else:
+        target_symbol = user_text
+
+    # Run Validator (Non-blocking now)
+    loop = asyncio.get_event_loop()
+    exists, category = await loop.run_in_executor(None, validate_ticker, target_symbol)
+
+    if not exists:
+        await status_msg.edit_text(f"❌ Symbol {target_symbol} not found on Bybit.")
         return
 
-    if data == "setrate":
-        chat_id = query.message.chat.id
-        threshold = get_chat_threshold(context, chat_id)
-        await query.message.reply_text(
-            f"Current threshold: `{format_threshold(threshold)}`\nUse `/rate -1.8` to change it.",
-            parse_mode="Markdown",
-        )
-        return
+    await status_msg.edit_text(f"✅ Found in {category}. Downloading data...")
 
-    if data == "frequency":
-        chat_id = query.message.chat.id
-        minutes = get_chat_interval(context, chat_id) // 60
-        await query.message.reply_text(
-            f"Current scan frequency: `{minutes}` minute(s)\nUse `/frequency 30` to change it.",
-            parse_mode="Markdown",
-        )
-        return
-
-    if data.startswith("ticker:"):
-        symbol = data.split(":", 1)[1]
-        await send_analysis_message(query.message, symbol, status_prefix="🔄 Refreshing")
-        return
-
-    if data.startswith("risk:"):
-        symbol = data.split(":", 1)[1]
-        await send_risk_message(query.message, symbol)
-        return
-
-    if data.startswith("topvol:"):
-        metric = data.split(":", 1)[1]
-        status_msg = await query.message.reply_text("🔥 Ranking volatility leaders...")
-        report = await run_blocking(build_topvol_report, metric, 10)
-        await status_msg.edit_text(
-            report,
-            parse_mode="Markdown",
-            reply_markup=build_general_keyboard(),
-        )
-        return
-
-
-async def text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Use commands only. Example: `/ticker BTC`, `/compare BTC ETH`, `/topvol`, `/risk BTC`.",
-        parse_mode="Markdown",
+    # C. Harvester Logic
+    # We pass the arguments: function, arg1, arg2, arg3 (interval="D")
+    candles = await loop.run_in_executor(
+        None, fetch_market_data, target_symbol, category, "D"
     )
+    if not candles:
+        await status_msg.edit_text("❌ Failed to download data.")
+        return
+
+    # D. Brain Logic
+    stats = analyze_market_data(candles)
+
+    if stats:
+        # We use .6f for ATR to handle meme coins with many decimals (e.g., 0.000001)
+        report = (
+            f"📊 **{target_symbol} based on {len(candles)} candles**\n\n"
+            f"📝 **DAILY STATS (close to close)**\n"
+            f"Volatility (Day): {stats['vol_day']*100:.2f}%\n"
+            f"Volatility (Week): {stats['vol_week']*100:.2f}%\n"
+            f"Max daily surge: {stats['max_daily_surge']*100:.2f}%\n"
+            f"Max daily crash: {stats['max_daily_crash']*100:.2f}%\n\n"
+            f"⬆️ **INTRADAY PUMP EXTREMES**\n"
+            f"=> open / high\n"
+            f"Biggest Pump: {stats['max_pump_val']*100:.2f}% on {stats['max_pump_date']}\n"
+            f"Average Pump: {stats['avg_pump']*100:.2f}%\n"
+            f"Pump Deviation (Std): {stats['std_pump']*100:.2f}%\n\n"
+            f"⬇️ **INTRADAY DUMP EXTREMES**\n"
+            f"=> open / low\n"
+            f"Worst Dump: {stats['max_dump_val']*100:.2f}% on {stats['max_dump_date']}\n"
+            f"Average Dump: {stats['avg_dump']*100:.2f}%\n"
+            f"Dump Deviation (Std): {stats['std_dump']*100:.2f}%\n\n"
+            f"↕️ **ATR (Average True Range)**\n"
+            f"ATR 14: {stats['atr_14']:.6f}\n"
+            f"ATR 28: {stats['atr_28']:.6f}\n"
+            f"ATR 28 to close: {stats['atr_relative']*100:.2f}%\n\n"
+            f"📈 **MARTINGALE BASED ON PERCENTILES**\n"
+            f"1st DCA (75%): {stats['p75_pump']*100:.2f}%\n"
+            f"2nd DCA (80%): {stats['p80_pump']*100:.2f}%\n"
+            f"3rd DCA (85%): {stats['p85_pump']*100:.2f}%\n"
+            f"4th DCA (90%): {stats['p90_pump']*100:.2f}%\n"
+            f"5th DCA (95%): {stats['p95_pump']*100:.2f}%\n"
+            f"6th DCA (99%): {stats['p99_pump']*100:.2f}%\n"
+        )
+    else:
+        report = "⚠️ Error: Could not calculate stats. Not enough data?"
+
+    # Send the final report
+    # parse_mode='Markdown' allows bold text
+    await update.message.reply_text(report, parse_mode="Markdown")
+
+    # Log the successful request
+    if candles:
+        print(
+            f"[Result] Request #{REQUEST_COUNT}: Sent report with {len(candles)} candles."
+        )
 
 
+# 3. THE ENGINE
 if __name__ == "__main__":
-    token = os.getenv("TELEGRAM_TOKEN_PROD")
-    if not token:
-        print("Error: TELEGRAM_TOKEN_PROD not found in .env file.")
-        raise SystemExit(1)
+    # original prod token
+    TOKEN = os.getenv("TELEGRAM_TOKEN_PROD")
 
-    application = ApplicationBuilder().token(token).build()
+    # development token for DevelopmentDloBot
+    # TOKEN = os.getenv("TELEGRAM_TOKEN_DEV")
+
+    if not TOKEN:
+        print("Error: TELEGRAM_TOKEN_PROD not found in .env file.")
+        exit(1)
+
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("ticker", ticker))
-    application.add_handler(CommandHandler("compare", compare))
     application.add_handler(CommandHandler("funding", funding))
-    application.add_handler(CommandHandler("rate", rate))
     application.add_handler(CommandHandler("frequency", frequency))
-    application.add_handler(CommandHandler("topvol", topvol))
-    application.add_handler(CommandHandler("risk", risk))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_fallback))
+
+    # This handler listens to ALL text messages that aren't commands
+    application.add_handler(
+        MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
+    )
+
+    # Run forever
     application.run_polling()
