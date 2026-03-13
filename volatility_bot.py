@@ -29,6 +29,33 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Global Request Counter
 REQUEST_COUNT = 0
 
+
+def get_chat_threshold(context, chat_id: int) -> float:
+    return context.bot_data.get(
+        f"funding_threshold_{chat_id}",
+        float(os.getenv("FUNDING_THRESHOLD", -0.015)),
+    )
+
+
+def format_threshold_percent(threshold: float) -> str:
+    return f"{threshold * 100:.2f}%"
+
+
+def parse_rate_threshold(raw_value: str) -> float:
+    normalized = raw_value.strip().replace("%", "").replace(",", ".")
+    threshold = float(normalized)
+
+    if threshold > 0:
+        threshold = -threshold
+
+    if abs(threshold) >= 1:
+        threshold /= 100
+
+    if threshold >= 0 or threshold <= -1:
+        raise ValueError("Threshold must be a negative percentage.")
+
+    return threshold
+
 # 2. THE HANDLERS (The new "Input/Output" layer)
 
 
@@ -67,19 +94,14 @@ async def scan_funding_job(context: ContextTypes.DEFAULT_TYPE):
     """Background task to scan for extreme funding rates."""
     # Run in executor
     loop = asyncio.get_event_loop()
-    # Use default threshold from add_func (-0.01) or specify it here if needed.
-    # User wanted -0.01 (1%)
-    # Get threshold from env, default to -0.015 if not set
-    threshold = float(os.getenv("FUNDING_THRESHOLD", -0.015))
+    job = context.job
+    threshold = get_chat_threshold(context, job.chat_id) if job else float(
+        os.getenv("FUNDING_THRESHOLD", -0.015)
+    )
     report = await loop.run_in_executor(None, check_extreme_funding, threshold)
 
     if report:
-        # Send to the user who started the bot?
-        # Since we don't have a database of users, we can try to send to the chat_id from context.job.chat_id
-        # or broadcast if we had a list.
-        # For this simple bot, we'll assume the job is started with a chat_id.
-        job = context.job
-        if job.chat_id:
+        if job and job.chat_id:
             await context.bot.send_message(
                 job.chat_id,
                 text=report,
@@ -159,12 +181,42 @@ async def frequency(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get or set the background funding alert threshold for this chat."""
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+        threshold = get_chat_threshold(context, chat_id)
+        await update.message.reply_text(
+            "Current funding alert threshold: "
+            f"{format_threshold_percent(threshold)}"
+        )
+        return
+
+    try:
+        threshold = parse_rate_threshold(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Usage: /rate -1,2\n"
+            "Example values: /rate -1,2 or /rate -1.2"
+        )
+        return
+
+    context.bot_data[f"funding_threshold_{chat_id}"] = threshold
+    await update.message.reply_text(
+        "✅ Funding alert threshold updated to "
+        f"{format_threshold_percent(threshold)}"
+    )
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a concise list of all available bot commands."""
     help_text = (
         "🤖 *Volatility Bot — Available Commands*\n\n"
         "/start — Initialize the bot and start background funding scan\n"
         "/funding — Fetch the top 10 most negative funding rates right now\n"
+        "/rate — Show current funding alert threshold\n"
+        "/rate <negative %> — Change alert threshold (e.g. `/rate -1,2`)\n"
         "/frequency <min> — Change how often the background scan runs "
         "(e.g. `/frequency 30` = every 30 min)\n"
         "/help — Show this help message\n\n"
@@ -286,6 +338,7 @@ if __name__ == "__main__":
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("funding", funding))
+    application.add_handler(CommandHandler("rate", rate))
     application.add_handler(CommandHandler("frequency", frequency))
     application.add_handler(CommandHandler("help", help_command))
 

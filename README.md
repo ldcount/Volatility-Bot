@@ -22,6 +22,8 @@ A Telegram bot that analyzes crypto market volatility using Bybit market data.
 |---------|-------------|
 | `/start` | Initialize the bot and begin the background funding scan for your chat. |
 | `/funding` | Fetch the top 10 most negative funding rates on Bybit right now. |
+| `/rate` | Show the current funding alert threshold used by the background scan for your chat. |
+| `/rate -1,2` | Change the funding alert threshold to `-1.2%` while the bot is running. |
 | `/frequency <minutes>` | Set how often the background scan runs. E.g. `/frequency 30` = every 30 min, `/frequency 1` = every minute. |
 | `/help` | Show the full list of commands with explanations. |
 | `<TICKER>` | Send any coin name (e.g. `BTC`, `PEPE`) for a full volatility report. |
@@ -64,6 +66,7 @@ SCAN_INTERVAL=1200           # Default background scan interval in seconds (20 m
 ```
 
 The scan interval can also be changed at runtime via the `/frequency` command without restarting the bot.
+The funding alert threshold can also be changed at runtime via `/rate` for the current chat while the bot process is running.
 
 ## Run locally
 
@@ -75,6 +78,8 @@ Once running, in Telegram:
 
 - `/start` — initialize the bot and begin background funding scan.
 - `/funding` — view the top negative funding rates on demand.
+- `/rate` — view the current funding alert threshold.
+- `/rate -1,2` — change the funding alert threshold to `-1.2%`.
 - `/frequency 30` — change the background scan to run every 30 minutes.
 - `/help` — view all available commands.
 - Send a ticker like `BTC` or `PEPE` to get a volatility analysis report.
@@ -84,6 +89,7 @@ Once running, in Telegram:
 - A repeating job is created per chat after `/start` (or on first interaction).
 - Default interval is controlled by `SCAN_INTERVAL` in `.env` (default: 1200 s / 20 min).
 - The interval can be changed live at any time with `/frequency <minutes>`.
+- The funding alert threshold defaults to `FUNDING_THRESHOLD` in `.env`, but can be changed live per chat with `/rate`.
 - The job sends alerts when funding rates are at or below the configured threshold.
 
 ## Deployment (systemd)
