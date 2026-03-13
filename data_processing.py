@@ -1,281 +1,330 @@
-import requests
+import math
 import statistics
-import math 
+import time
 from datetime import datetime
+
+import requests
 from pybit.unified_trading import HTTP
-from pprint import pprint
 
-# ==========================================
-# BLOCK 1: THE GATEKEEPER
-# ==========================================
+BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
+BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
+INSTRUMENTS_CACHE_TTL = 300
 
-def validate_ticker(ticker_symbol):
+_INSTRUMENT_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
+
+
+def normalize_symbol(raw_symbol: str) -> str:
+    symbol = raw_symbol.strip().upper()
+    if not symbol:
+        return symbol
+    if symbol.endswith(("USDT", "USDC", "USD")):
+        return symbol
+    return f"{symbol}USDT"
+
+
+def _get_cached_instruments(category: str) -> dict[str, dict]:
+    now = time.time()
+    cached = _INSTRUMENT_CACHE.get(category)
+    if cached and now - cached[0] < INSTRUMENTS_CACHE_TTL:
+        return cached[1]
+
+    instruments_map: dict[str, dict] = {}
+    cursor = ""
+
+    while True:
+        params = {"category": category, "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+
+        response = requests.get(BYBIT_INSTRUMENTS_URL, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("retCode") != 0:
+            raise RuntimeError(data.get("retMsg", "Unknown Bybit instruments error"))
+
+        instruments = data.get("result", {}).get("list", [])
+        for item in instruments:
+            symbol = item.get("symbol")
+            if symbol:
+                instruments_map[symbol] = item
+
+        cursor = data.get("result", {}).get("nextPageCursor", "")
+        if not cursor:
+            break
+
+    _INSTRUMENT_CACHE[category] = (now, instruments_map)
+    return instruments_map
+
+
+def validate_ticker(ticker_symbol: str):
     """
-    Verifies if a symbol exists on Bybit across Linear, Inverse, or Spot markets.
-    
-    Args:
-        ticker_symbol (str): The full symbol name (e.g., 'BTCUSDT').
-        
     Returns:
-        tuple: (exists (bool), category (str))
-        Example: (True, 'linear') or (False, None)
+      (True, category, None) when symbol exists
+      (False, None, error_code) on failure where error_code is one of:
+        not_found, timeout, network, api_error
     """
-    #print(f"[Gatekeeper] Validating symbol: {ticker_symbol}...")
-    
-    # We check these categories in order of preference for a bot
-    # 'linear' (USDT Perpetuals) is usually what traders want.
     search_order = ["linear", "inverse", "spot"]
+    last_error = None
 
     for category in search_order:
         try:
-            # PAGINATION LOOP:
-            # Bybit limits results to 1000 per page. We must loop to see everything.
-            cursor = ""
-            while True:
-                params = {
-                    "category": category,
-                    "limit": 1000, 
-                }
-                if cursor:
-                    params["cursor"] = cursor
+            instruments = _get_cached_instruments(category)
+            if ticker_symbol in instruments:
+                return True, category, None
+        except requests.Timeout:
+            last_error = "timeout"
+        except requests.RequestException:
+            last_error = "network"
+        except Exception as exc:
+            print(f"[Gatekeeper] Error checking category '{category}': {exc}")
+            last_error = "api_error"
 
-                # We use raw requests here for precise control over the pagination loop
-                response = requests.get(
-                    "https://api.bybit.com/v5/market/instruments-info", 
-                    params=params,
-                    timeout=10 # Good practice: always set a timeout
-                )
-                response.raise_for_status() # Crashes if API sends 404 or 500 error
-                data = response.json()
-                
-                # 1. Extract the list of coins from this page
-                instruments = data.get("result", {}).get("list", [])
-                
-                # 2. Check if our ticker is in this list
-                # Optimization: We check 'symbol' directly.
-                for item in instruments:
-                    if item.get("symbol") == ticker_symbol:
-                        #print(f"[Gatekeeper] Success! Found {ticker_symbol} in '{category}'.")
-                        return True, category
-                
-                # 3. Check for the next page
-                cursor = data.get("result", {}).get("nextPageCursor", "")
-                if not cursor:
-                    break # No more pages in this category, move to the next category
-                    
-        except Exception as e:
-            print(f"[Gatekeeper] Error checking category '{category}': {e}")
-            continue # Try the next category even if one fails
-            
-    # If we finish all loops and find nothing:
+    if last_error:
+        return False, None, last_error
+
     print(f"[Gatekeeper] Error: Symbol {ticker_symbol} not found on Bybit.")
-    return False, None
+    return False, None, "not_found"
 
-# ==========================================
-# BLOCK 2: THE HARVESTER (In-Memory Version)
-# ==========================================
 
 def fetch_market_data(ticker_symbol, category, interval="D"):
     """
-    Fetches historical candle data from Bybit and processes it in-memory.
-    DOES NOT SAVE TO CSV (Faster & Safer for Bots).
-    
-    Args:
-        ticker_symbol (str): e.g., 'BTCUSDT'
-        category (str): e.g., 'linear'
-        interval (str): 'D' for daily.
-        
     Returns:
-        list: The list of cleaned candle data if successful, else None.
+      (candles, None) on success
+      (None, error_code) where error_code is one of:
+        timeout, network, api_error, empty_data
     """
     print(f"\n[Harvester] Fetching data for {ticker_symbol} ({category})...")
-    
-    # Initialize Pybit session
     session = HTTP(testnet=False)
-    
+
     try:
-        # 1. Fetch from API
         response = session.get_kline(
             category=category,
             symbol=ticker_symbol,
             interval=interval,
-            limit=1000
+            limit=1000,
         )
-        
-        # 2. Extract and Reverse
+    except requests.Timeout:
+        return None, "timeout"
+    except requests.RequestException:
+        return None, "network"
+    except Exception as exc:
+        print(f"[Harvester] Transport error: {exc}")
+        return None, "api_error"
+
+    try:
+        if response.get("retCode") != 0:
+            print(f"[Harvester] API returned error: {response.get('retMsg')}")
+            return None, "api_error"
+
         raw_candles = response.get("result", {}).get("list", [])
         if not raw_candles:
             print("[Harvester] Error: API returned no candles.")
-            return None
-            
+            return None, "empty_data"
+
         raw_candles.reverse()
-        
-        # 3. Process Data (Convert Timestamps)
-        # We do this in-memory instead of writing to a file
         cleaned_candles = []
+
         for candle in raw_candles:
-            # Candle format: [startTime, open, high, low, close, volume, turnover]
-            
-            # Convert Timestamp to Date String
             ts = int(candle[0]) / 1000
             date_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
-            
-            # Update the candle's date field
-            candle[0] = date_str
-            cleaned_candles.append(candle)
-                
-        print(f"[Harvester] Successfully loaded {len(cleaned_candles)} candles into RAM.")
-        return cleaned_candles
+            cleaned_candles.append([date_str] + candle[1:])
 
-    except Exception as e:
-        print(f"[Harvester] Critical Error: {e}")
-        return None
+        print(f"[Harvester] Success! Processed {len(cleaned_candles)} candles in-memory.")
+        return cleaned_candles, None
+    except Exception as exc:
+        print(f"[Harvester] Processing error: {exc}")
+        return None, "api_error"
 
-# ==========================================
-# BLOCK 3: THE BRAIN (Logic & Math)
-# ==========================================
 
 def analyze_market_data(candles):
-    """
-    Performs quantitative analysis on candle data.
-    Now includes Log Returns, ATR, and detailed Percentiles.
-    """
-    # 1. Safety Checks
-    if not candles or len(candles) < 30: # Need at least 28 days for ATR
-        print("[Brain] Error: Not enough data (need > 30 candles).")
+    if not candles or len(candles) < 2:
+        print("[Brain] Error: Need at least 2 candles to analyze.")
         return None
 
-    # 2. Initialize Containers
-    # Intraday tracking
-    pump_data = []      # List of tuples: (value, date_str)
-    dump_data = []      # List of tuples: (value, date_str)
-    
-    # Interday tracking
-    log_returns = []    # ln(Close / PrevClose)
-    tr_list = []        # True Range values
+    pump_data = []
+    dump_data = []
+    log_returns = []
+    tr_list = []
 
-    # 3. The Grand Loop (O(N))
     for i, candle in enumerate(candles):
-        # Candle: [date, open, high, low, close, vol, turnover]
         date_str = candle[0]
         curr_open = float(candle[1])
         curr_high = float(candle[2])
         curr_low = float(candle[3])
         curr_close = float(candle[4])
 
-        # --- A. Intraday Pumps & Dumps (Open vs High/Low) ---
         if curr_open > 0:
-            # Pump: How much did it fly?
             pump = (curr_high - curr_open) / curr_open
             pump_data.append((pump, date_str))
-            
-            # Dump: How much did it bleed?
+
             dump = (curr_low - curr_open) / curr_open
             dump_data.append((dump, date_str))
 
-        # --- B. Interday Stats (Requires Previous Candle) ---
         if i > 0:
-            prev_close = float(candles[i-1][4])
-            
-            # 1. Logarithmic Returns (Standard Finance Volatility)
-            # Formula: ln(Current_Close / Previous_Close)
+            prev_close = float(candles[i - 1][4])
             if prev_close > 0 and curr_close > 0:
                 log_ret = math.log(curr_close / prev_close)
                 log_returns.append(log_ret)
 
-            # 2. True Range (TR) Calculation
-            # TR = Max(High-Low, |High-PrevClose|, |Low-PrevClose|)
             raw_hl = curr_high - curr_low
             raw_h_pc = abs(curr_high - prev_close)
             raw_l_pc = abs(curr_low - prev_close)
-            
-            true_range = max(raw_hl, raw_h_pc, raw_l_pc)
-            tr_list.append(true_range)
+            tr_list.append(max(raw_hl, raw_h_pc, raw_l_pc))
 
-    # 4. Compiling the Stats Dictionary
     stats = {}
-    
-    # --- SECTION A: VOLATILITY (Log Returns) ---
-    if len(log_returns) > 1:
-        # Standard deviation of log returns
-        stdev_log = statistics.stdev(log_returns)
-        stats['vol_day'] = stdev_log
-        stats['vol_week'] = stdev_log * (7 ** 0.5) # Annualized rule applied to week
-    else:
-        stats['vol_day'] = 0.0
-        stats['vol_week'] = 0.0
 
-    # Max moves (Converted back to linear % for display readability)
-    # We use the raw daily change for "Max Surge" just for display purposes
-    # But strictly speaking, the user asked for Log, so we stick to Log stats for Vol.
-    # For "Max Daily Surge" display, simple % is often more intuitive, 
-    # but I will use the Max Log Return converted to linear: (e^x - 1)
+    if len(log_returns) > 1:
+        stdev_log = statistics.stdev(log_returns)
+        stats["vol_day"] = stdev_log
+        stats["vol_week"] = stdev_log * (7**0.5)
+    else:
+        stats["vol_day"] = 0.0
+        stats["vol_week"] = 0.0
+
     max_log = max(log_returns) if log_returns else 0
     min_log = min(log_returns) if log_returns else 0
-    stats['max_daily_surge'] = math.exp(max_log) - 1
-    stats['max_daily_crash'] = math.exp(min_log) - 1
+    stats["max_daily_surge"] = math.exp(max_log) - 1
+    stats["max_daily_crash"] = math.exp(min_log) - 1
 
-    # --- SECTION B: INTRADAY EXTREMES ---
-    # Max Pump
     if pump_data:
-        stats['max_pump_val'], stats['max_pump_date'] = max(pump_data, key=lambda x: x[0])
+        stats["max_pump_val"], stats["max_pump_date"] = max(pump_data, key=lambda x: x[0])
         pump_values = [x[0] for x in pump_data]
-        stats['avg_pump'] = statistics.mean(pump_values)
-        stats['std_pump'] = statistics.stdev(pump_values) if len(pump_values) > 1 else 0
+        stats["avg_pump"] = statistics.mean(pump_values)
+        stats["std_pump"] = statistics.stdev(pump_values) if len(pump_values) > 1 else 0
     else:
-        stats['max_pump_val'], stats['max_pump_date'] = (0, "N/A")
-        stats['avg_pump'] = 0
-        stats['std_pump'] = 0
+        stats["max_pump_val"], stats["max_pump_date"] = (0, "N/A")
+        stats["avg_pump"] = 0
+        stats["std_pump"] = 0
 
-    # Max Dump (Min because negative)
     if dump_data:
-        stats['max_dump_val'], stats['max_dump_date'] = min(dump_data, key=lambda x: x[0])
+        stats["max_dump_val"], stats["max_dump_date"] = min(dump_data, key=lambda x: x[0])
         dump_values = [x[0] for x in dump_data]
-        stats['avg_dump'] = statistics.mean(dump_values)
-        stats['std_dump'] = statistics.stdev(dump_values) if len(dump_values) > 1 else 0
+        stats["avg_dump"] = statistics.mean(dump_values)
+        stats["std_dump"] = statistics.stdev(dump_values) if len(dump_values) > 1 else 0
     else:
-        stats['max_dump_val'], stats['max_dump_date'] = (0, "N/A")
-        stats['avg_dump'] = 0
-        stats['std_dump'] = 0
+        stats["max_dump_val"], stats["max_dump_date"] = (0, "N/A")
+        stats["avg_dump"] = 0
+        stats["std_dump"] = 0
 
-    # --- SECTION C: ATR (Risk Management) ---
-    # We take the Simple Moving Average of the LAST n TR values.
-    # This is slightly different from Wilder's Smoothing but statistically valid for snapshots.
     current_close = float(candles[-1][4])
-    
+    stats["close"] = current_close
+
     if len(tr_list) >= 14:
-        stats['atr_14'] = statistics.mean(tr_list[-14:])
+        stats["atr_14"] = statistics.mean(tr_list[-14:])
     else:
-        stats['atr_14'] = 0
-        
+        stats["atr_14"] = 0
+
     if len(tr_list) >= 28:
         atr_28 = statistics.mean(tr_list[-28:])
-        stats['atr_28'] = atr_28
-        stats['atr_relative'] = atr_28 / current_close if current_close > 0 else 0
+        stats["atr_28"] = atr_28
+        stats["atr_relative"] = atr_28 / current_close if current_close > 0 else 0
     else:
-        stats['atr_28'] = 0
-        stats['atr_relative'] = 0
+        stats["atr_28"] = 0
+        stats["atr_relative"] = 0
 
-    # --- SECTION D: PERCENTILES (Martingale Logic) ---
-    # We focus on PUMPS for the DCA levels
     if pump_data:
-        # Extract values and sort
-        pv = sorted([p[0] for p in pump_data])
-        n = len(pv)
-        
-        # Helper for safe indexing
-        def get_p(percent):
-            return pv[int(n * percent)] if n > 0 else 0
+        pump_values_sorted = sorted([p[0] for p in pump_data])
+        n = len(pump_values_sorted)
 
-        stats['p75_pump'] = get_p(0.75)
-        stats['p80_pump'] = get_p(0.80)
-        stats['p85_pump'] = get_p(0.85)
-        stats['p90_pump'] = get_p(0.90)
-        stats['p95_pump'] = get_p(0.95)
-        stats['p99_pump'] = get_p(0.99)
+        def get_p(percent):
+            index = min(max(int(n * percent), 0), n - 1)
+            return pump_values_sorted[index]
+
+        stats["p75_pump"] = get_p(0.75)
+        stats["p80_pump"] = get_p(0.80)
+        stats["p85_pump"] = get_p(0.85)
+        stats["p90_pump"] = get_p(0.90)
+        stats["p95_pump"] = get_p(0.95)
+        stats["p99_pump"] = get_p(0.99)
     else:
-        # Zeros if no data
-        for k in ['p75_pump','p80_pump','p85_pump','p90_pump','p95_pump','p99_pump']:
-            stats[k] = 0.0
+        for key in ["p75_pump", "p80_pump", "p85_pump", "p90_pump", "p95_pump", "p99_pump"]:
+            stats[key] = 0.0
 
     return stats
+
+
+def analyze_symbol(symbol: str, category: str | None = None):
+    normalized = normalize_symbol(symbol)
+
+    if category is None:
+        exists, category, validation_error = validate_ticker(normalized)
+        if not exists:
+            return {
+                "ok": False,
+                "symbol": normalized,
+                "error": validation_error,
+            }
+    else:
+        validation_error = None
+
+    candles, fetch_error = fetch_market_data(normalized, category, "D")
+    if not candles:
+        return {
+            "ok": False,
+            "symbol": normalized,
+            "category": category,
+            "error": fetch_error,
+        }
+
+    stats = analyze_market_data(candles)
+    if not stats:
+        return {
+            "ok": False,
+            "symbol": normalized,
+            "category": category,
+            "error": "insufficient_data",
+        }
+
+    return {
+        "ok": True,
+        "symbol": normalized,
+        "category": category,
+        "candles": candles,
+        "stats": stats,
+        "validation_error": validation_error,
+    }
+
+
+def get_linear_tickers():
+    try:
+        response = requests.get(
+            BYBIT_TICKERS_URL,
+            params={"category": "linear", "limit": 1000},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("retCode") != 0:
+            raise RuntimeError(data.get("retMsg", "Unknown Bybit tickers error"))
+
+        return data.get("result", {}).get("list", [])
+    except Exception as exc:
+        print(f"[Tickers] Error fetching linear tickers: {exc}")
+        return []
+
+
+def get_top_liquid_symbols(limit=25):
+    tickers = get_linear_tickers()
+    if not tickers:
+        return []
+
+    ranked = sorted(
+        tickers,
+        key=lambda item: float(item.get("turnover24h") or 0),
+        reverse=True,
+    )
+
+    symbols = []
+    for item in ranked:
+        symbol = item.get("symbol")
+        if not symbol:
+            continue
+        if not symbol.endswith(("USDT", "USDC")):
+            continue
+        symbols.append(symbol)
+        if len(symbols) >= limit:
+            break
+
+    return symbols
